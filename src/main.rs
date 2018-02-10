@@ -110,6 +110,8 @@ fn main() {
                 for i in 0..32 {
                     println!("r{}: 0x{:08x}", i, avb.cpu.reg_gpr(i));
                 }
+
+                println!("psw: 0x{:08x}", avb.cpu.reg_psw());
             }
             Ok(Command::Step) => {
                 avb.step();
@@ -206,12 +208,19 @@ fn disassemble_instruction(avb: &mut AVB, labels: &mut HashMap<String, u32>, cur
             if opcode == Opcode::Jmp {
                 println!("jmp [r{}]", reg1);
             } else {
-                println!("{}, r{}, r{}", opcode, reg1, reg2)    
+                println!("{} r{}, r{}", opcode, reg1, reg2)    
             }
 
             let imm16 = second_halfword;
 
             println!("{}, {:#x}, r{}, r{}", opcode, imm16, reg1, reg2)
+        }
+
+        InstructionFormat::II => {
+            let imm5 = (first_halfword & 0x1f) as usize;
+            let reg2 = ((first_halfword >> 5) & 0x1f) as usize;
+
+            println!("{} {}, r{}", opcode, imm5, reg2)
         }
 
         InstructionFormat::V => {

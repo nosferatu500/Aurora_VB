@@ -33,7 +33,14 @@ impl Interconnect {
 
     pub fn write_byte(&mut self, addr: u32, value: u8) {
         let addr = addr & 0x07ffffff;
-        panic!("Unrecognized addr: {:#08x}", addr);
+
+        if addr == 0x02000024 {
+            println!("Wait Control Register: ({:#08x}) written: 0x{:02x}", addr, value);
+            println!("Cartridge ROM Waits: {}", if value & 0x01 == 0 { 2 } else { 1 });
+            println!(" Cartridge Expansion Waits: {}", if value & 0x02 == 0 { 2 } else { 1 });
+        } else {
+            panic!("Unrecognized addr: {:#08x}", addr);
+        }
     }
 
     pub fn write_word(&mut self, addr: u32, value: u32) {
