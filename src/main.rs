@@ -6,7 +6,7 @@ extern crate nom;
 mod rom;
 mod interconnect;
 
-use nom::{IResult, eof, space, digit};
+use nom::{IResult, eof, space, digit, hex_digit, alphanumeric};
 
 use rom::*;
 use interconnect::*;
@@ -16,6 +16,7 @@ use std::io::{stdin, stdout, Write};
 use std::borrow::Cow;
 use std::str::{self, FromStr};
 use std::fmt;
+use std::collections::HashMap;
 
 #[derive(PartialEq, Eq)]
 enum Opcode {
@@ -76,9 +77,13 @@ impl InstructionFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Command {
+    Goto(u32),
+    ShowMem(Option<u32>),
     Disassemble(usize),
+    Label,
+    AddLabel(String, u32),
     Exit,
     Repeat,
 }
@@ -114,6 +119,8 @@ fn main() {
 
     let interconnect = Interconnect::new(rom);
 
+    let mut labels = HashMap::new();
+
     let mut cursor = 0xfffffff0;
 
     let mut last_command = None;
@@ -123,7 +130,7 @@ fn main() {
 
         stdout().flush().unwrap();
 
-        let command = match (read_stdin().parse(), last_command) {
+        let command = match (read_stdin().parse(), last_command.clone()) {
             (Ok(Command::Repeat), Some(c)) => Ok(c),
             (Ok(Command::Repeat), None) => Err("No last command".into()),
             (Ok(c), _) => Ok(c),
@@ -131,9 +138,41 @@ fn main() {
         };
 
         match command {
+            Ok(Command::Goto(addr)) => {
+                cursor = addr;
+            }
+            Ok(Command::ShowMem(addr)) => {
+                if let Some(addr) = addr {
+                    cursor = addr;
+                }
+
+                print_labels(&labels, cursor);
+
+                const NUM_ROWS: usize = 16;
+                const NUM_COLS: usize = 16;
+
+                for _ in 0..NUM_ROWS {
+                    print!("0x{:08x} ", cursor);
+
+                    for x in 0..NUM_COLS {
+                        let byte = interconnect.read_byte(cursor);
+                        cursor = cursor.wrapping_add(1);
+
+                        print!("{:02x} ", byte);
+
+                        if x < NUM_COLS - 1 {
+                            print!(" ");
+                        }
+                    }
+
+                    println!(" ");
+                }
+            }
             Ok(Command::Disassemble(count)) => {
                 for _ in 0..count {
-                    print!("0x{:#08x} ", cursor);
+                    print_labels(&labels, cursor);
+
+                    print!("0x{:08x} ", cursor);
 
                     let first_halfword = interconnect.read_halfword(cursor);
                     cursor = cursor.wrapping_add(2); // jump through distination & source registers.
@@ -193,6 +232,14 @@ fn main() {
                     }
                 }
             }
+            Ok(Command::Label) => {
+                for (name, addr) in labels.iter() {
+                    println!(".{}: 0x{:08x}", name, addr);
+                }
+            }
+            Ok(Command::AddLabel(ref name, addr)) => {
+                labels.insert(name.clone(), addr);
+            }
             Ok(Command::Exit) => break,
             Ok(Command::Repeat) => unreachable!(),
             Err(ref e) => println!("{}", e),
@@ -201,6 +248,12 @@ fn main() {
         if let Ok(c) = command {
             last_command = Some(c);
         }
+    }
+}
+
+fn print_labels(labels: &HashMap<String, u32>, addr: u32) {
+    for (name, _) in labels.iter().filter(|x| *x.1 == addr) {
+        println!(".{}:", name);
     }
 }
 
@@ -215,10 +268,83 @@ named!(
     complete!(
         terminated!(
             alt_complete!(
-                disassemble | exit | repeat
+                goto | show_mem | disassemble | exit | repeat |
+                label | add_label
             ),
             eof
         )
+    )
+);
+
+named!(
+    label<Command>,
+    map!(
+        alt_complete!(
+            tag!("label") | tag!("l")
+        ),
+        |_| Command::Label
+    )
+);
+
+named!(
+    add_label<Command>,
+    chain!(
+        alt_complete!(
+            tag!("addlabel") | tag!("al")
+        ) ~ space ~ name: label_name ~ space ~ addr: hex_u32_parser,
+        || Command::AddLabel(name, addr)
+    )
+);
+
+named!(
+    label_name<String>,
+    preceded!(
+        char!('.'),
+        map_res!(
+            map_res!(
+                alphanumeric, str::from_utf8
+            ),
+            FromStr::from_str
+        )
+    )
+);
+
+
+named!(
+    show_mem<Command>,
+    chain!(
+        alt_complete!(
+            tag!("showmem") | tag!("mem") | tag!("m")
+        ) ~ addr: opt!(preceded!(space, hex_u32_parser)),
+        || Command::ShowMem(addr)
+    )
+);
+
+named!(
+    goto<Command>,
+    chain!(
+        alt_complete!(
+            tag!("goto") | tag!("g")
+        ) ~ addr: preceded!(space, hex_u32_parser),
+        || Command::Goto(addr)
+    )
+);
+
+named!(
+    hex_u32_parser<u32>,
+    map_res!(
+        map_res!(
+            preceded!(
+                opt!(
+                    alt_complete!(
+                        tag!("0x") | tag!("$")
+                    )        
+                ),
+                hex_digit
+            ),
+            str::from_utf8
+        ),
+        |s| u32::from_str_radix(s, 16)
     )
 );
 
