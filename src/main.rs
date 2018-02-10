@@ -1,13 +1,37 @@
 extern crate encoding;
 
-use encoding::DecoderTrap;
-use encoding::label::encoding_from_whatwg_label;
+#[macro_use]
+extern crate nom;
+
+mod rom;
+mod interconnect;
+
+use nom::IResult;
+
+use rom::*;
+use interconnect::*;
 
 use std::env;
-use std::fs::File;
-use std::io::Read;
+use std::io::{stdin, stdout, Write};
+use std::borrow::Cow;
+use std::str::{self, FromStr};
 
-const MAX_ROM_SIZE: usize = 16777216; // 16 Mb.
+#[derive(Debug, Clone, Copy)]
+pub enum Command {
+    Exit,
+    Repeat,
+}
+
+impl FromStr for Command {
+    type Err = Cow<'static, str>;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match command(s.as_bytes()) {
+            IResult::Done(_, c) => Ok(c),
+            err => Err(format!("Unable to parse command: {:?}", err).into()),
+        }
+    }
+}
 
 fn main() {
     let rom_file_name = env::args().nth(1).unwrap();
@@ -18,49 +42,70 @@ fn main() {
 
     println!("\nLoading ROM file '{}'", rom_file_name);
 
-    let mut rom_buf = Vec::new();
-    let mut rom_file = File::open(&rom_file_name).unwrap();
-
-    rom_file.read_to_end(&mut rom_buf).unwrap();
-
-    let rom_size = rom_buf.len();
-
-    if rom_size > MAX_ROM_SIZE {
-        panic!("Invalid ROM size.");
-    }
-
-    let header_offset = rom_size - 544;
+    let rom = Rom::load(rom_file_name).unwrap();
 
     println!("\nHeader info:");
 
-    // Game title
-    let name_bytes = &rom_buf[header_offset..header_offset + 0x14];
-    let encoding = encoding_from_whatwg_label("shift-jis").unwrap();
-    let name = encoding.decode(name_bytes, DecoderTrap::Strict).unwrap();
+    println!("\nGame: {}", rom.name().unwrap());
+    println!("\nMaker code: {}", rom.maker_code().unwrap());
+    println!("\nGame code: {}", rom.game_code().unwrap());
+    println!("\nGame version: 1.{:#02}\n", rom.game_version());
 
-    //Maker code
-    let maker_code_offset = header_offset + 0x19;
-    let maker_code_bytes = &rom_buf[maker_code_offset..maker_code_offset + 2];
+    let interconnect = Interconnect::new(rom);
 
-    let mut maker_code_vec = Vec::new();
-    maker_code_vec.extend_from_slice(maker_code_bytes);
+    let mut cursor = 0xfffffff0;
 
-    let maker_code = String::from_utf8(maker_code_vec).unwrap();
+    let mut last_command = None;
 
-    //Game code
-    let game_code_offset = header_offset + 0x1b;
-    let game_code_bytes = &rom_buf[game_code_offset..game_code_offset + 2];
-    
-    let mut game_code_vec = Vec::new();
-    game_code_vec.extend_from_slice(game_code_bytes);
+    loop {
+        print!("(vb {:#08x}) ", cursor);
 
-    let game_code = String::from_utf8(game_code_vec).unwrap();
+        stdout().flush().unwrap();
 
-    //Game version
-    let game_version_byte = &rom_buf[header_offset + 0x1f];    
+        let command = match (read_stdin().parse(), last_command) {
+            (Ok(Command::Repeat), Some(c)) => Ok(c),
+            (Ok(Command::Repeat), None) => Err("No last command".into()),
+            (Ok(c), _) => Ok(c),
+            (Err(e), _) => Err(e),
+        };
 
-    println!("\nGame: {}", name);
-    println!("\nMaker code: {}", maker_code);
-    println!("\nGame code: {}", game_code);
-    println!("\nGame version: 1.{:#02}\n", game_version_byte);
+        match command {
+            Ok(Command::Exit) => break,
+            Ok(Command::Repeat) => unreachable!(),
+            Err(ref e) => println!("{}", e),
+        }
+
+        last_command = command.ok();
+    }
 }
+
+fn read_stdin() -> String {
+    let mut input = String::new();
+    stdin().read_line(&mut input).unwrap();
+    input.trim().into()
+}
+
+named!(
+    command<Command>,
+    terminated!(
+        alt_complete!(
+            exit | repeat
+        ),
+        eof!()
+    )
+);
+
+named!(
+    exit<Command>,
+    map!(
+        alt_complete!(
+            tag!("exit") | tag!("quit") | tag!("q") | tag!("e")
+        ),
+        |_| Command::Exit
+    )
+);
+
+named!(
+    repeat<Command>,
+    value!(Command::Repeat)
+);
