@@ -5,80 +5,27 @@ extern crate nom;
 
 mod rom;
 mod interconnect;
+mod instruction;
+mod nvc;
 
 use nom::{IResult, eof, space, digit, hex_digit, alphanumeric};
 
 use rom::*;
 use interconnect::*;
+use instruction::*;
+use nvc::*;
 
 use std::env;
 use std::io::{stdin, stdout, Write};
 use std::borrow::Cow;
 use std::str::{self, FromStr};
-use std::fmt;
 use std::collections::HashMap;
 
-#[derive(PartialEq, Eq)]
-enum Opcode {
-    Movhi,
-    Movea,
-    Jmp,
-    Outw,
-}
-
-impl Opcode {
-    fn from_halfword(halfword: u16) -> Opcode {
-        let opcode_bits = halfword >> 10;
-        match opcode_bits {
-            0b101111 => Opcode::Movhi,
-            0b101000 => Opcode::Movea,
-            0b000110 => Opcode::Jmp,
-            0b111111 => Opcode::Outw,
-            _ => panic!("Unrecognized opcode bits: {:06b}", opcode_bits)
-        }
-    }
-
-    fn instruction_format(&self) -> InstructionFormat {
-        match self {          
-            &Opcode::Movhi => InstructionFormat::V,
-            &Opcode::Movea => InstructionFormat::V,
-            &Opcode::Jmp => InstructionFormat::I,
-            &Opcode::Outw => InstructionFormat::VI,
-        }
-    }
-}
-
-impl fmt::Display for Opcode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mnemonic = match self {
-            &Opcode::Movhi => "movhi",
-            &Opcode::Movea => "movea",
-            &Opcode::Jmp => "jmp",
-            &Opcode::Outw => "outw",
-        };
-        write!(f, "{}", mnemonic)
-    }
-}
-
-#[derive(Debug)]
-enum InstructionFormat {
-    I,
-    V,
-    VI
-}
-
-impl InstructionFormat {
-    fn has_second_halfword(&self) -> bool {
-        match self {
-            &InstructionFormat::I => false,
-            &InstructionFormat::V => true,
-            &InstructionFormat::VI => true,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub enum Command {
+    ShowRegs,
+    Step,
     Goto(u32),
     ShowMem(Option<u32>),
     Disassemble(usize),
@@ -96,6 +43,24 @@ impl FromStr for Command {
             IResult::Done(_, c) => Ok(c),
             err => Err(format!("Unable to parse command: {:?}", err).into()),
         }
+    }
+}
+
+struct AVB {
+    pub interconnect: Interconnect,
+    pub cpu: Nvc,
+}
+
+impl AVB {
+    pub fn new(rom: Rom) -> AVB {
+        AVB {
+            interconnect: Interconnect::new(rom),
+            cpu: Nvc::new()
+        }
+    }
+
+    pub fn step(&mut self) {
+        self.cpu.step(&mut self.interconnect);
     }
 }
 
@@ -117,7 +82,7 @@ fn main() {
     println!("\nGame code: {}", rom.game_code().unwrap());
     println!("\nGame version: 1.{:#02}\n", rom.game_version());
 
-    let interconnect = Interconnect::new(rom);
+    let mut avb = AVB::new(rom);
 
     let mut labels = HashMap::new();
 
@@ -138,6 +103,20 @@ fn main() {
         };
 
         match command {
+            Ok(Command::ShowRegs) => {
+                println!("pc: 0x{:08x}", avb.cpu.reg_pc());
+                println!("gpr:");
+
+                for i in 0..32 {
+                    println!("r{}: 0x{:08x}", i, avb.cpu.reg_gpr(i));
+                }
+            }
+            Ok(Command::Step) => {
+                avb.step();
+                cursor = avb.cpu.reg_pc();
+                disassemble_instruction(&mut avb, &mut labels, &mut cursor);
+                cursor = avb.cpu.reg_pc();
+            }
             Ok(Command::Goto(addr)) => {
                 cursor = addr;
             }
@@ -155,7 +134,7 @@ fn main() {
                     print!("0x{:08x} ", cursor);
 
                     for x in 0..NUM_COLS {
-                        let byte = interconnect.read_byte(cursor);
+                        let byte = avb.interconnect.read_byte(cursor);
                         cursor = cursor.wrapping_add(1);
 
                         print!("{:02x} ", byte);
@@ -170,66 +149,7 @@ fn main() {
             }
             Ok(Command::Disassemble(count)) => {
                 for _ in 0..count {
-                    print_labels(&labels, cursor);
-
-                    print!("0x{:08x} ", cursor);
-
-                    let first_halfword = interconnect.read_halfword(cursor);
-                    cursor = cursor.wrapping_add(2); // jump through distination & source registers.
-
-                    print!("{:02x}{:02x}", first_halfword & 0xff, first_halfword >> 8);
-
-                    let opcode = Opcode::from_halfword(first_halfword);
-
-                    let instruction_format = opcode.instruction_format();
-
-                    let second_halfword = if instruction_format.has_second_halfword() {
-                        let second_halfword = interconnect.read_halfword(cursor);
-                        print!("{:02x}{:02x}", second_halfword & 0xff, second_halfword >> 8);
-
-                        cursor = cursor.wrapping_add(2);
-                        second_halfword
-                    } else {
-                        print!("      ");
-                        0
-                    };
-
-                    print!("      ");
-
-                    match instruction_format {
-                        InstructionFormat::I => {
-                            let reg1 = (first_halfword & 0x1f) as usize;
-                            let reg2 = ((first_halfword >> 5) & 0x1f) as usize;
-
-                            if opcode == Opcode::Jmp {
-                                println!("jmp [r{}]", reg1);
-                            } else {
-                                println!("{}, r{}, r{}", opcode, reg1, reg2)    
-                            }
-
-                            let imm16 = second_halfword;
-
-                            println!("{}, {:#x}, r{}, r{}", opcode, imm16, reg1, reg2)
-                        }
-
-                        InstructionFormat::V => {
-                            let reg1 = (first_halfword & 0x1f) as usize;
-                            let reg2 = ((first_halfword >> 5) & 0x1f) as usize;
-
-                            let imm16 = second_halfword;
-
-                            println!("{} {:#x}, r{}, r{}", opcode, imm16, reg1, reg2)
-                        }
-
-                        InstructionFormat::VI => {
-                            let reg1 = (first_halfword & 0x1f) as usize;
-                            let reg2 = ((first_halfword >> 5) & 0x1f) as usize;
-
-                            let disp16 = second_halfword as i16;
-
-                            println!("{} {}[r{}], r{}", opcode, disp16, reg1, reg2)
-                        }
-                    }
+                    disassemble_instruction(&mut avb, &mut labels, &mut cursor);
                 }
             }
             Ok(Command::Label) => {
@@ -247,6 +167,69 @@ fn main() {
 
         if let Ok(c) = command {
             last_command = Some(c);
+        }
+    }
+}
+
+fn disassemble_instruction(avb: &mut AVB, labels: &mut HashMap<String, u32>, cursor: &mut u32) {
+    print_labels(labels, *cursor);
+
+    print!("0x{:08x} ", cursor);
+
+    let first_halfword = avb.interconnect.read_halfword(*cursor);
+    *cursor = cursor.wrapping_add(2); // jump through distination & source registers.
+
+    print!("{:02x}{:02x}", first_halfword & 0xff, first_halfword >> 8);
+
+    let opcode = Opcode::from_halfword(first_halfword);
+
+    let instruction_format = opcode.instruction_format();
+
+    let second_halfword = if instruction_format.has_second_halfword() {
+        let second_halfword = avb.interconnect.read_halfword(*cursor);
+        print!("{:02x}{:02x}", second_halfword & 0xff, second_halfword >> 8);
+
+        *cursor = cursor.wrapping_add(2);
+        second_halfword
+    } else {
+        print!("      ");
+        0
+    };
+
+    print!("      ");
+
+    match instruction_format {
+        InstructionFormat::I => {
+            let reg1 = (first_halfword & 0x1f) as usize;
+            let reg2 = ((first_halfword >> 5) & 0x1f) as usize;
+
+            if opcode == Opcode::Jmp {
+                println!("jmp [r{}]", reg1);
+            } else {
+                println!("{}, r{}, r{}", opcode, reg1, reg2)    
+            }
+
+            let imm16 = second_halfword;
+
+            println!("{}, {:#x}, r{}, r{}", opcode, imm16, reg1, reg2)
+        }
+
+        InstructionFormat::V => {
+            let reg1 = (first_halfword & 0x1f) as usize;
+            let reg2 = ((first_halfword >> 5) & 0x1f) as usize;
+
+            let imm16 = second_halfword;
+
+            println!("{} {:#x}, r{}, r{}", opcode, imm16, reg1, reg2)
+        }
+
+        InstructionFormat::VI => {
+            let reg1 = (first_halfword & 0x1f) as usize;
+            let reg2 = ((first_halfword >> 5) & 0x1f) as usize;
+
+            let disp16 = second_halfword as i16;
+
+            println!("{} {}[r{}], r{}", opcode, disp16, reg1, reg2)
         }
     }
 }
@@ -269,10 +252,30 @@ named!(
         terminated!(
             alt_complete!(
                 goto | show_mem | disassemble | exit | repeat |
-                label | add_label
+                label | add_label | show_regs | step
             ),
             eof
         )
+    )
+);
+
+named!(
+    show_regs<Command>,
+    map!(
+        alt_complete!(
+            tag!("showregs") | tag!("r")
+        ),
+        |_| Command::ShowRegs
+    )
+);
+
+named!(
+    step<Command>,
+    map!(
+        alt_complete!(
+            tag!("step") | tag!("s")
+        ),
+        |_| Command::Step
     )
 );
 
